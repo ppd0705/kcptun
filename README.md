@@ -66,6 +66,10 @@ which tunnels the original connection:
 
 > Application -> Target Server(8388/tcp) 
 
+If kcp server `-t` is empty, then kcp server runs as a https proxy:
+
+> Application(https) -> **KCP Client(8388/tcp) -> KCP Server(4000/udp)** -> Target HTTPS Server(tcp)
+
 ### Build from source
 
 ```

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"fmt"
 	"io"
@@ -36,11 +37,15 @@ var VERSION = "SELFBUILD"
 
 // handle multiplex-ed connection
 func handleMux(conn net.Conn, config *Config) {
-	// check if target is unix domain socket
-	var isUnix bool
-	if _, _, err := net.SplitHostPort(config.Target); err != nil {
-		isUnix = true
+	isHTTPSProxy := config.Target == ""
+	targetNetwork := "tcp"
+	if !isHTTPSProxy {
+		// check if target is unix domain socket
+		if _, _, err := net.SplitHostPort(config.Target); err != nil {
+			targetNetwork = "unix"
+		}
 	}
+
 	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
 
 	// stream multiplex
@@ -66,21 +71,63 @@ func handleMux(conn net.Conn, config *Config) {
 
 		go func(p1 *smux.Stream) {
 			var p2 net.Conn
-			var err error
-			if !isUnix {
-				p2, err = net.Dial("tcp", config.Target)
+			var ok bool
+			if isHTTPSProxy {
+				p2, ok = newHTTPSTargetConn(p1, config.Quiet)
 			} else {
-				p2, err = net.Dial("unix", config.Target)
+				p2, ok = newTargetConn(targetNetwork, config.Target)
 			}
 
-			if err != nil {
-				log.Println(err)
+			if !ok {
 				p1.Close()
 				return
 			}
 			handleClient(p1, p2, config.Quiet)
 		}(stream)
 	}
+}
+
+func newTargetConn(network, target string) (net.Conn, bool) {
+	conn, err := net.Dial(network, target)
+	if err != nil {
+		log.Println(err)
+		return nil, false
+	}
+	return conn, true
+}
+
+func newHTTPSTargetConn(p1 *smux.Stream, quiet bool) (net.Conn, bool) {
+	loglf := func(f string, v ...interface{}) {
+		if !quiet {
+			log.Printf(f, v...)
+		}
+	}
+
+	br := bufio.NewReader(p1)
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		loglf("%d read request error: %s\n", p1.ID(), err)
+		return nil, false
+	}
+	if req.Method != http.MethodConnect {
+		loglf("%d invalid method %s\n", p1.ID(), req.Method)
+		_, _ = p1.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+		return nil, false
+	}
+	_, _ = p1.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp", req.Host)
+	if err != nil {
+		loglf("%d invalid addr %s\n", p1.ID(), req.Host)
+		return nil, false
+	}
+	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	if err != nil {
+		loglf("%d dial %s: %s\n", p1.ID(), req.Host, err)
+		return nil, false
+	}
+	_ = conn.SetNoDelay(true)
+	return conn, true
 }
 
 func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool) {
@@ -137,8 +184,8 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "target, t",
-			Value: "127.0.0.1:12948",
-			Usage: "target server address, or path/to/unix_socket",
+			Value: "",
+			Usage: "target server address, or path/to/unix_socket, set as https proxy if empty",
 		},
 		cli.StringFlag{
 			Name:   "key",
